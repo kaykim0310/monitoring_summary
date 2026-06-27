@@ -75,6 +75,144 @@ def classify_factor(factor_name):
 
     return "기타"
 
+# ---------------------------------------------------------------------------
+# 공정명(그룹) 줄바꿈 보정용 유틸리티
+#   text 전략은 '소재양산 QA그룹'처럼 긴 공정명이 '소재양산 QA' + '그룹'으로
+#   행이 쪼개져 별도 공정으로 잘못 인식된다. 표 괘선(lines) 전략으로 추출한
+#   '정식 공정명' 목록을 사전(canonical)으로 만들어, text 전략에서 나온 조각을
+#   원래 공정명으로 합쳐 준다.
+# ---------------------------------------------------------------------------
+_GROUP_HEADER_WORDS = {
+    "부서또는", "공정명", "공정", "단위", "단위작업장소", "작업장소", "유해인자",
+    "자수", "근로", "근로형태및", "측정", "측정위치", "발생시간", "발생형태및",
+    "노출", "노출기준", "평가결과", "측정농도", "비고", "측정치", "전회", "금회",
+    "기준", "횟수",
+}
+_GROUP_JUNK_KEYWORDS = (
+    "측정방법", "여과채취", "검출한계", "고체채취", "확산포집", "소음계",
+    "소음노출", "dB", "도시소음", "주어진",
+)
+
+
+def _norm_group(s):
+    return re.sub(r"\s+", "", s or "").lower()
+
+
+def _is_noise_text(txt):
+    return ("결과(소음)" in txt) or ("(소음)" in txt and "소음 제외" not in txt)
+
+
+def _is_group_junk(c0):
+    n = _norm_group(c0)
+    if not n or n in _GROUP_HEADER_WORDS:
+        return True
+    return any(k.lower() in c0.lower() for k in _GROUP_JUNK_KEYWORDS)
+
+
+def build_canonical_groups(pdf):
+    """표 괘선 전략으로 0열(공정명)을 모아 정식 공정명 목록을 만든다."""
+    cand, seen = [], set()
+    settings = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
+    for page in pdf.pages:
+        if _is_noise_text(page.extract_text() or ""):
+            continue
+        try:
+            tables = page.extract_tables(table_settings=settings) or []
+        except Exception:
+            tables = []
+        for t in tables:
+            for r in t:
+                if not r or not r[0]:
+                    continue
+                g = str(r[0]).replace("\n", "").strip()
+                if _is_group_junk(g):
+                    continue
+                gn = _norm_group(g)
+                if gn not in seen:
+                    seen.add(gn)
+                    cand.append(g)
+
+    # 짧은 것부터 보며, 이미 확보한 공정명들의 연결로 만들어지는 후보(여러 공정이
+    # 한 셀에 합쳐진 행)는 제외하고 '원자' 공정명만 남긴다.
+    cand.sort(key=lambda x: len(_norm_group(x)))
+
+    def can_segment(s, parts):
+        if not s:
+            return True
+        return any(s.startswith(p) and can_segment(s[len(p):], parts)
+                   for p in parts if p)
+
+    atoms = []
+    atom_norms = []
+    for g in cand:
+        gn = _norm_group(g)
+        if can_segment(gn, atom_norms):
+            continue
+        atoms.append(g)
+        atom_norms.append(gn)
+
+    # 여러 공정이 한 셀에 합쳐진 '병합 공정명'(예: '장비운전원보통인부',
+    # '목공사면보강...')은 다른 공정명을 접두/접미로 포함한다. 이런 항목은
+    # 신뢰할 수 없으므로 제거한다. (이 경우 text 전략 원본값으로 폴백)
+    cleaned = []
+    for a in atoms:
+        an = _norm_group(a)
+        merged = any(b != a and (an.startswith(_norm_group(b)) or an.endswith(_norm_group(b)))
+                     for b in atoms)
+        if not merged:
+            cleaned.append(a)
+    return cleaned
+
+
+def map_group_name(g, state, canon, canon_norm):
+    """text 전략에서 나온 0열 조각 g를 정식 공정명으로 매핑.
+
+    반환값:
+      - 문자열: 그 공정으로 전환(새 공정 시작)
+      - None  : 직전 공정명의 이어진 조각이므로 흡수(공정 전환 아님)
+    """
+    gn = _norm_group(g)
+    if not gn:
+        return state.get("canon")
+
+    # 1) 정식 공정명의 '시작 부분'이면 새 공정 (정확히 일치 우선, 없으면 최단)
+    prefix = [c for c, cn in zip(canon, canon_norm) if cn.startswith(gn)]
+    if prefix:
+        exact = [c for c in prefix if _norm_group(c) == gn]
+        chosen = exact[0] if exact else min(prefix, key=lambda x: len(_norm_group(x)))
+        state["canon"] = chosen
+        return chosen
+
+    # 2) 현재 공정명 안에 들어있는 조각이면 흡수 (예: '소재양산 QA그룹'의 '그룹',
+    #    '패키징소재그룹(EMC)'의 '룹(EMC)')
+    cc = state.get("canon")
+    if cc and gn in _norm_group(cc):
+        return None
+
+    # 3) 사전에 없으면 조각 그대로 새 공정
+    state["canon"] = g
+    return g
+
+
+def resolve_noise_group(g, canon, canon_norm):
+    """소음표 0열 값을 정식 공정명으로 해석. 줄바꿈 조각(접미/중간 부분)은
+    None을 반환해 가짜 공정 생성을 막는다."""
+    gn = _norm_group(g)
+    if not gn:
+        return None
+    for c, cn in zip(canon, canon_norm):
+        if cn == gn:
+            return c
+    prefix = [c for c, cn in zip(canon, canon_norm) if cn.startswith(gn)]
+    if prefix:
+        return min(prefix, key=lambda x: len(_norm_group(x)))
+    # 어떤 정식 공정명의 일부 조각이면 버림(예: '그룹', '룹(EMC)', 'Slurry)')
+    if any(gn in cn for cn in canon_norm):
+        return None
+    # 사전에 없는 독립 공정명이면 그대로 사용
+    return g
+
+
 def extract_job_data(pdf_path):
     # 계층적 데이터 저장: jobs[group_name][unit_name] = data
     jobs = defaultdict(lambda: defaultdict(lambda: {
@@ -127,8 +265,6 @@ def extract_job_data(pdf_path):
 
                     # 컬럼 추출 (인덱스 조심, text strategy는 컬럼이 밀릴 수 있음)
                     # 보통 0:Group, 1:Null?, 2..:Unit?, ..:Workers?
-                    # 공백 컬럼이 많을 수 있으니 index heuristic 필요 할 수도 있지만
-                    # pdfplumber는 col 구조를 유지하려고 노력함.
                     # Col 0: Group (might be empty)
                     # Col 2: Job Content (might be empty)
                     # Col 3: Factors
@@ -275,11 +411,47 @@ def extract_job_data_impl(pdf_path):
                 if m: company_info["project"] = m.group(1).strip()
         except: pass
 
+        # 소음 측정표(나-2)에 등장한 공정 -> 근로자수/단위작업 (fallback용)
+        noise_info = {}
+
+        # 공정명 줄바꿈 보정용 정식 공정명 사전 + 진행 상태
+        canonical = build_canonical_groups(pdf)
+        canonical_norm = [_norm_group(c) for c in canonical]
+        canon_state = {"canon": None, "matched": ""}
+
         for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            # 나-2 "결과(소음)" 페이지 식별. 나-1은 "결과(소음 제외)"이므로 제외.
+            is_noise_page = ("결과(소음)" in page_text) or \
+                            ("(소음)" in page_text and "소음 제외" not in page_text)
+
             tables = page.extract_tables(table_settings={"horizontal_strategy": "text"})
             for table in tables:
                 if not table: continue
-                
+
+                # 소음 결과표(나-2)는 '유해인자' 열이 없고 '발생형태' 열에 '불규칙소음'이
+                # 들어 있어 일반 표 파서가 인식하지 못한다. 나-2 표 전체가 소음 측정이므로
+                # 여기 등장하는 모든 공정(0열)을 수집해, 뒤에서 물리적인자(소음)를 추가한다.
+                # (공정명과 '불규칙소음' 셀이 서로 다른 행에 찍히는 경우가 있어 같은 행 조건을
+                #  걸지 않는다.)
+                if is_noise_page:
+                    header_words = ("공정", "부서", "단위작업장소", "발생형태", "근로자수", "작업내용")
+                    for nrow in table:
+                        if not nrow: continue
+                        joined = "".join([str(c) for c in nrow if c])
+                        if "측정방법" in joined: continue
+                        g = str(nrow[0]).replace("\n", " ").strip() if nrow[0] else ""
+                        if not g or g in header_words:
+                            continue
+                        g = resolve_noise_group(g, canonical, canonical_norm)
+                        if not g:
+                            continue
+                        w = str(nrow[3]).replace("\n", " ").strip() if len(nrow) > 3 and nrow[3] else ""
+                        u = str(nrow[2]).replace("\n", " ").strip() if len(nrow) > 2 and nrow[2] else ""
+                        noise_info.setdefault(g, {"worker": w, "unit": u})
+                    continue
+
+
                 # 1. Detect Header
                 header_found = False
                 for row in table[:5]:
@@ -292,18 +464,24 @@ def extract_job_data_impl(pdf_path):
                             if "공정" in txt or "부서" in txt: col_map["group"] = cb_idx
                             elif "작업" in txt or "장소" in txt or "단위" in txt: col_map["unit"] = cb_idx
                             elif "유해" in txt or "인자" in txt: col_map["factor"] = cb_idx
-                            elif "근로" in txt or "자수" in txt or "측정치" in txt:
-                                if "치" not in txt: col_map["worker"] = cb_idx
+                            elif "자수" in txt or "인원" in txt or ("근로" in txt and "자명" not in txt and "시간" not in txt and "형태" not in txt):
+                                # "근로자수" matches "자수" and "근로".
+                                # "근로자명" matches "근로" but has "자명".
+                                # "실제근로시간" matches "근로" but has "시간".
+                                # "근로형태" matches "근로" but has "형태".
+                                # Strict priority: If already set by "자수", don't overwrite with vague "근로".
+                                if "자수" in txt or "인원" in txt:
+                                     col_map["worker"] = cb_idx
+                                elif "worker" not in col_map: # Only set if empty
+                                     col_map["worker"] = cb_idx
                             elif "형태" in txt or "근무" in txt: col_map["form"] = cb_idx
                         header_found = True
                         break
                 
-                current_group = None
-                current_unit = None
-                
-                # Flag to track if the current unit 'row' seems complete (has workers/form)
-                # If complete, next text implies new unit.
-                unit_row_completed = False
+                # Loop variables init
+                last_group = None
+                last_job = None
+                factor_buf = ""   # 괄호로 줄바꿈된 유해인자명 재조립용 버퍼
 
                 for row in table:
                     if not row or len(row) < 3: continue
@@ -312,7 +490,7 @@ def extract_job_data_impl(pdf_path):
                     if "공정" in row_full and "작업" in row_full: continue
                     if "측정방법" in row_full or "비고" in row_full: continue 
                     if "평균치" in row_full: continue
-                    if "측정시각" in row_full: continue # Time header
+                    if "측정시각" in row_full: continue 
 
                     def get_col(idx):
                         if idx < len(row) and row[idx]:
@@ -325,126 +503,234 @@ def extract_job_data_impl(pdf_path):
                     w_text = get_col(col_map["worker"])
                     form_text = get_col(col_map["form"])
                     
-                    # Garbage Filter: Timestamps / Footer
-                    # If any text contains "~" and ":" (e.g. ~ 15:30), it's likely a timestamp row
-                    if re.search(r'~\s*\d{1,2}:\d{2}', row_full) or re.search(r'\d{1,2}:\d{2}\s*~', row_full):
-                        continue
-                    if "종료" in row_full or "시작" in row_full:
-                        continue
-                    
-                    # Worker Val: Keep exact string 
-                    w_val = None
-                    if w_text: 
-                         w_val = w_text
-                    
-                    # Unit Name Cleanup: Ignore numeric garbage
-                    if u_text and (u_text.isdigit() or re.match(r'^\d+(\s+\d+)*$', u_text) or len(u_text) < 2 and u_text.isdigit()):
-                        if not w_val: w_val = u_text # Fallback
+                    # Garbage Filter: 셀 단위 타임스탬프 정리
+                    # (행 전체에 측정시각(~15:51)이 있다고 통째로 버리면, 같은 행에 실린
+                    #  단위작업명 연장부분/근로자수/유해인자 뒷부분이 함께 사라진다.
+                    #  -> 행을 버리지 말고, 측정시각이 잘못 들어온 셀만 비운다.)
+                    _ts = r'\d{1,2}\s*:\s*\d{2}'
+                    if u_text and (re.search(_ts, u_text) or u_text.lstrip().startswith("~")):
                         u_text = ""
+                    if f_text and (re.search(_ts, f_text) or f_text.lstrip().startswith("~")):
+                        f_text = ""
 
-                    # Logic: When to start a New Unit?
-                    # 1. Group text exists -> Definitely New Group -> New Unit
-                    # 2. Unit text exists AND Previous Unit was 'Completed' (had workers/factors populated in a way that implies end)
-                    # OR just standard: If Unit text exists -> New Unit (unless it looks like wrapped text).
-                    # 'Wrapped text' heuristic: Previous line had NO workers/form, and this line has text.
+                    # Heuristic: Column Shift Correction
+                    # If Worker Count is empty but Unit/Factor has pure number, it's likely the count shifted.
                     
-                    start_new_unit = False
+                    # 1. Check Unit Name column
+                    if u_text and (u_text.isdigit() or re.match(r'^\d+(\s+\d+)*$', u_text)):
+                         if not w_text: 
+                              w_text = u_text
+                         u_text = ""
                     
+                    # 2. Check Factor column
+                    if f_text and f_text.isdigit():
+                         if not w_text:
+                              w_text = f_text
+                         f_text = ""
+
+                    # Worker Text Cleanup
+                    if w_text:
+                        if re.match(r'^P\s*\d+$', w_text, re.IGNORECASE):
+                             w_text = ""
+                        # Filter out "Shift" info like "1조1교대" or "480분" appearing in Count column
+                        if "교대" in w_text or "분" in w_text or ":" in w_text:
+                             w_text = ""
+
+                    # Strict Row Separation Logic
+                    # 공정명 줄바꿈 보정: g_text를 정식 공정명으로 매핑.
+                    group_absorbed = False
                     if g_text:
-                        current_group = g_text
-                        start_new_unit = True
-                    elif u_text:
-                        # If we have text, is it a new unit or continuation?
-                        if unit_row_completed:
-                            start_new_unit = True
+                        mapped = map_group_name(g_text, canon_state, canonical, canonical_norm)
+                        if mapped is None:
+                            # 직전 공정명의 이어진 조각 -> 공정 전환 아님(이어붙임)
+                            group_absorbed = True
+                            current_group = last_group
                         else:
-                            # Previous row didn't have workers/form.
-                            # It might be a continuation of the name.
-                            # OR it might be distinct unit that just has no worker data (unlikely for "Distribution" report)
-                            # Let's assume continuation.
-                            start_new_unit = False
-                    
-                    # If we don't have a current unit object yet, force start
-                    if not current_unit and (g_text or u_text):
-                        if not g_text and current_group: # Continuation of group but start of first unit finding
-                             start_new_unit = True
-                        elif g_text:
-                             start_new_unit = True
+                            current_group = mapped
+                            last_group = mapped
+                    else:
+                        current_group = last_group
 
-                    if start_new_unit:
-                        current_unit = {
-                            "name_parts": [],
+                    if not current_group: continue
+
+                    # Determine if this row starts a new unit
+                    is_new_unit_row = False
+                    should_merge_prev = False
+                    
+                    # Logic:
+                    # 1. If u_text exists:
+                    #    - If w_text exists (Data Present):
+                    #         - If last_unit has NO workers -> MERGE (Assume it was a header/part 1).
+                    #         - Else -> NEW UNIT (Distinct).
+                    #    - If w_text is Empty:
+                    #         - NEW UNIT (Inherit workers) -> Supports MQC/NMR split.
+                    # 2. If u_text empty:
+                    #    - MERGE (Continuation).
+                    
+                    if u_text:
+                        if w_text:
+                            # Check previous unit
+                            if jobs[current_group]:
+                                last_val = jobs[current_group][-1]["workers"]
+                                if not last_val:
+                                    should_merge_prev = True
+                                    is_new_unit_row = False
+                                else:
+                                    is_new_unit_row = True
+                            else:
+                                is_new_unit_row = True
+                        else:
+                            # Name present, No Data -> New Unit (Inherit)
+                            # (Unless we want to treat "No Data" as continuation? 
+                            #  User wants split for MQC. So Inherit is safer for "Split" preference.)
+                            is_new_unit_row = True
+                    else:
+                        # No name -> Continuation
+                        is_new_unit_row = False
+                        should_merge_prev = True # Implicitly merge
+
+                    # 공정명 조각이 흡수된 행(예: '소재양산 QA' 다음의 '그룹')은
+                    # 단위작업도 직전 단위의 이어진 부분이므로 새 단위로 만들지 않는다.
+                    if group_absorbed and jobs[current_group]:
+                        is_new_unit_row = False
+                        should_merge_prev = True
+
+                    if is_new_unit_row:
+                        # Prepare workers: if empty, inherit
+                        use_workers = w_text
+                        if not use_workers and jobs[current_group]:
+                             use_workers = jobs[current_group][-1]["workers"]
+
+                        entry = {
+                            "group": current_group,
+                            "name_parts": [u_text] if u_text else [],
                             "factors": defaultdict(set),
-                            "workers": "", # String accumulation
+                            "workers": use_workers if use_workers else "",
                             "work_form": set()
                         }
-                        if current_group:
-                            jobs[current_group].append(current_unit)
-                        unit_row_completed = False
-                        
-                    if not current_unit: continue
-                    
-                    # 1. Name Parts
-                    if u_text:
-                        current_unit["name_parts"].append(u_text)
-                    
-                    # 2. Workers
-                    if w_val:
-                        # User wants exact string.
-                        # If multiple rows have workers for same 'unit' (merged cells with split rows?), logic says we started new unit?
-                        # If we are here, it means we are in 'current_unit'.
-                        # If 'current_unit' already has workers, and we see NEW workers on this line...
-                        # It suggests we missed a split? 
-                        # Or it's just aggregating.
-                        # Given "Strict Separation", if we see `w_val`, it flags completion.
-                        current_unit["workers"] = w_val # Overwrite or append? "16(4)" usually one line.
-                        unit_row_completed = True
-                        
-                    # 3. Form
-                    if form_text:
-                        if "교대" in form_text:
-                            current_unit["work_form"].add(form_text.split()[0])
-                        unit_row_completed = True # Form implies completion row usually
-                            
-                    # 4. Factors
-                    if f_text and "유해인자" not in f_text:
-                        if f_text.isdigit(): pass
+                        if form_text: entry["work_form"].add(form_text)
+                        jobs[current_group].append(entry)
+                        factor_buf = ""   # 새 단위작업 시작 -> 유해인자 버퍼 초기화
+                    else:
+                        if not jobs[current_group]:
+                             # Edge case: No start unit but data implies continuation? 
+                             # Create fallback unit
+                             entry = {
+                                "group": current_group,
+                                "name_parts": [u_text] if u_text else [],
+                                "factors": defaultdict(set),
+                                "workers": w_text if w_text else "",
+                                "work_form": set()
+                             }
+                             if form_text: entry["work_form"].add(form_text)
+                             jobs[current_group].append(entry)
                         else:
-                            parts = f_text.split()
-                            for p in parts:
-                                p = p.strip()
-                                cat = classify_factor(p)
-                                if cat:
-                                    current_unit["factors"][cat].add(p)
+                             entry = jobs[current_group][-1]
+                             if u_text and u_text not in entry["name_parts"]:
+                                  entry["name_parts"].append(u_text)
+                             
+                             if w_text:
+                                  # If we are merging, and w_text is present, update.
+                                  entry["workers"] = w_text
 
-    # Post-process: Just flatten name parts
+                             if form_text: entry["work_form"].add(form_text)
+
+                    # Extract factors (괄호 기준으로 줄바꿈된 유해인자명 재조립)
+                    if f_text:
+                        for sub in re.split(r'[\n]', f_text):
+                            sub = sub.strip()
+                            if not sub: continue
+                            combined = (factor_buf + sub) if factor_buf else sub
+                            # 여는 괄호가 아직 안 닫혔으면 다음 조각과 이어붙임
+                            if combined.count("(") > combined.count(")"):
+                                factor_buf = combined
+                                continue
+                            factor_buf = ""
+                            cat = classify_factor(combined)
+                            if jobs[current_group]:
+                                target_cat = cat if cat else "기타"
+                                jobs[current_group][-1]["factors"][target_cat].add(combined)
+
+    # 소음 결과표(나-2)에서 수집한 공정에 물리적인자(소음) 추가
+    for grp, info in noise_info.items():
+        if not grp or grp in ("공정", "부서", "부서 또는", "단위작업장소"):
+            continue
+        if grp in jobs and jobs[grp]:
+            jobs[grp][0]["factors"]["물리적인자"].add("소음")
+        else:
+            # 소음 표에만 존재하는 공정 -> 최소 항목 생성
+            entry = {
+                "group": grp,
+                "name_parts": [info.get("unit")] if info.get("unit") else [],
+                "factors": defaultdict(set),
+                "workers": info.get("worker", ""),
+                "work_form": set(),
+            }
+            entry["factors"]["물리적인자"].add("소음")
+            jobs[grp].append(entry)
+
+    # Post-process: 단위작업명 정리 + 페이지에 걸쳐 쪼개진/중복된 단위 병합
     final_jobs = defaultdict(list)
-    
+
     for grp, unit_list in jobs.items():
         if not grp: continue
         # Filter out Header Groups
         if grp == "공정" or grp == "부서" or grp == "단위작업장소": continue
-        
+
+        consolidated = []  # 같은 공정 내 병합된 단위 목록
         for u in unit_list:
-            full_name = " ".join(u["name_parts"]).strip()
-            
+            full_name = "".join(u["name_parts"]).strip()
+
             # Check for timestamp in worker field (e.g. 07:07) -> Garbage unit
             w_str = str(u["workers"])
             if re.search(r'\d{2}:\d{2}', w_str):
                 continue
-            
-            if not full_name: 
+
+            if not full_name:
                 # If no name, and no significant data, skip
                 if not u["factors"] and not w_str: continue
                 full_name = "(공정명 없음)"
-            
+
             # If name is still empty/placeholder and no meaningful data, skip
             if full_name == "(공정명 없음)" and (not w_str or w_str.strip() == ""):
                  continue
 
-            # Save refined object
-            u["job_content"] = full_name 
-            final_jobs[grp].append(u)
+            u["job_content"] = full_name
+
+            # 같은 단위가 페이지마다 반복되거나, 줄바꿈으로 쪼개진 조각
+            # (예: '비계/거푸집 조립' + '&해체, 타설')은 하나로 합친다.
+            nkey = re.sub(r"\s+", "", full_name)
+            target = None
+            for c in consolidated:
+                ckey = re.sub(r"\s+", "", c["job_content"])
+                if nkey == ckey or nkey in ckey or ckey in nkey:
+                    target = c
+                    break
+            if target is None:
+                # 새 단위 (factors를 합치기 좋게 복사)
+                new_u = {
+                    "job_content": full_name,
+                    "name_parts": list(u["name_parts"]),
+                    "factors": defaultdict(set),
+                    "workers": u["workers"],
+                    "work_form": set(u["work_form"]),
+                }
+                for c, s in u["factors"].items():
+                    new_u["factors"][c] |= s
+                consolidated.append(new_u)
+            else:
+                # 더 긴(완전한) 이름 채택
+                if len(re.sub(r"\s+", "", full_name)) > len(re.sub(r"\s+", "", target["job_content"])):
+                    target["job_content"] = full_name
+                    target["name_parts"] = list(u["name_parts"])
+                for c, s in u["factors"].items():
+                    target["factors"][c] |= s
+                if u["workers"] and not target["workers"]:
+                    target["workers"] = u["workers"]
+                target["work_form"] |= u["work_form"]
+
+        for c in consolidated:
+            final_jobs[grp].append(c)
 
     return company_info, final_jobs
 
@@ -495,7 +781,7 @@ def convert_pdf_to_txt(pdf_path):
         # Valid Units Filter
         valid_units = []
         for u in unit_list:
-            full_name = " ".join(u["name_parts"]).strip()
+            full_name = "".join(u["name_parts"]).strip()
             w_str = str(u["workers"])
             if re.search(r'\d{2}:\d{2}', w_str): continue # detailed timestamp filter
             
@@ -586,28 +872,30 @@ def convert_pdf_to_txt(pdf_path):
             worker_lines.append((nm, info))
 
         if worker_lines:
-            # Check if simple summary possible (1 entry and name is redundant or empty)
-            if len(worker_lines) == 1:
-                 # Just print info
-                 lines.append(f"   ◇ 근무현황 : {worker_lines[0][1]}")
-            else:
-                # Multiple entries. 
-                # Check if all infos are identical? If so, just sum? No, user wants exact strings.
-                # Use detailed format: Name (Info)
+            # Force Detailed Output for consistency
+            is_first_print = True
+            for nm, info in worker_lines:
+                # If Name is strictly same as group, we might want to hide it, 
+                # BUT user complaints suggest they want explicit naming context.
+                # Only hide if strictly "(공정명 없음)"
                 
-                # First line
-                nm, info = worker_lines[0]
-                if nm == "(공정명 없음)" or nm in group_name: # if name redundant
-                    lines.append(f"   ◇ 근무현황 : {info}")
+                disp_name = nm
+                if nm == "(공정명 없음)":
+                    disp_name = ""
+                    
+                # Format: "Name (Info)"
+                # If Name is empty, just "(Info)"? Or "Info"?
+                # Standard: "(Info)" if no name.
+                
+                content = ""
+                if disp_name:
+                    content = f"{disp_name:<13}({info})"
                 else:
-                    lines.append(f"   ◇ 근무현황 : {nm:<13}({info})")
+                    content = f"({info})"
                 
-                # Subsequent lines
-                for nm, info in worker_lines[1:]:
-                    if nm == "(공정명 없음)" or nm in group_name:
-                         lines.append(f"                 : {info}")
-                    else:
-                         lines.append(f"                 : {nm:<13}({info})")
+                prefix = "   ◇ 근무현황 :" if is_first_print else "                 :"
+                lines.append(f"{prefix} {content}")
+                is_first_print = False
         
         lines.append("-" * 93)
 
