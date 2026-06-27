@@ -114,8 +114,6 @@ def build_canonical_groups(pdf):
     cand, seen = [], set()
     settings = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
     for page in pdf.pages:
-        if _is_noise_text(page.extract_text() or ""):
-            continue
         try:
             tables = page.extract_tables(table_settings=settings) or []
         except Exception:
@@ -411,9 +409,6 @@ def extract_job_data_impl(pdf_path):
                 if m: company_info["project"] = m.group(1).strip()
         except: pass
 
-        # 소음 측정표(나-2)에 등장한 공정 -> 근로자수/단위작업 (fallback용)
-        noise_info = {}
-
         # 공정명 줄바꿈 보정용 정식 공정명 사전 + 진행 상태
         canonical = build_canonical_groups(pdf)
         canonical_norm = [_norm_group(c) for c in canonical]
@@ -422,35 +417,14 @@ def extract_job_data_impl(pdf_path):
         for page in pdf.pages:
             page_text = page.extract_text() or ""
             # 나-2 "결과(소음)" 페이지 식별. 나-1은 "결과(소음 제외)"이므로 제외.
+            # 소음표는 '유해인자' 열이 없고 '발생형태(불규칙소음)' 열만 있으므로,
+            # 이 페이지의 유해인자는 일괄 '소음'으로 처리한다(아래 f_text 강제).
             is_noise_page = ("결과(소음)" in page_text) or \
                             ("(소음)" in page_text and "소음 제외" not in page_text)
 
             tables = page.extract_tables(table_settings={"horizontal_strategy": "text"})
             for table in tables:
                 if not table: continue
-
-                # 소음 결과표(나-2)는 '유해인자' 열이 없고 '발생형태' 열에 '불규칙소음'이
-                # 들어 있어 일반 표 파서가 인식하지 못한다. 나-2 표 전체가 소음 측정이므로
-                # 여기 등장하는 모든 공정(0열)을 수집해, 뒤에서 물리적인자(소음)를 추가한다.
-                # (공정명과 '불규칙소음' 셀이 서로 다른 행에 찍히는 경우가 있어 같은 행 조건을
-                #  걸지 않는다.)
-                if is_noise_page:
-                    header_words = ("공정", "부서", "단위작업장소", "발생형태", "근로자수", "작업내용")
-                    for nrow in table:
-                        if not nrow: continue
-                        joined = "".join([str(c) for c in nrow if c])
-                        if "측정방법" in joined: continue
-                        g = str(nrow[0]).replace("\n", " ").strip() if nrow[0] else ""
-                        if not g or g in header_words:
-                            continue
-                        g = resolve_noise_group(g, canonical, canonical_norm)
-                        if not g:
-                            continue
-                        w = str(nrow[3]).replace("\n", " ").strip() if len(nrow) > 3 and nrow[3] else ""
-                        u = str(nrow[2]).replace("\n", " ").strip() if len(nrow) > 2 and nrow[2] else ""
-                        noise_info.setdefault(g, {"worker": w, "unit": u})
-                    continue
-
 
                 # 1. Detect Header
                 # 헤더 라벨이 여러 행에 흩어져 있고(예: '유해인자'가 별도 행),
@@ -482,22 +456,26 @@ def extract_job_data_impl(pdf_path):
                         detected["factor"] = idx
                     elif "자수" in txt or "인원" in txt:
                         detected["worker"] = idx
-                    elif "형태" in txt or "근무" in txt:
+                    elif "근로형태" in txt or "근무" in txt:
+                        # '발생형태'(소음표의 불규칙소음 열)와 구분하기 위해 '근로형태'로 한정
                         detected["form"] = idx
                     elif "작업장소" in txt or "단위" in txt:
                         detected["unit"] = idx
                     elif "공정" in txt or "부서" in txt:
                         detected["group"] = idx
 
-                header_found = ("factor" in detected and "group" in detected)
+                # 소음표(나-2)는 '유해인자' 열이 없으므로 factor 없이도 헤더 인정
+                header_found = ("group" in detected and
+                                ("worker" in detected or "unit" in detected))
                 if header_found:
                     # 이 표 기준으로 컬럼 매핑을 새로 설정(이전 표 값 잔류 방지)
+                    g0 = detected.get("group", 0)
                     col_map = {
-                        "group": detected.get("group", 0),
-                        "unit": detected.get("unit", detected.get("group", 0) + 1),
-                        "factor": detected["factor"],
-                        "worker": detected.get("worker", detected["factor"] + 1),
-                        "form": detected.get("form", detected["factor"] + 2),
+                        "group": g0,
+                        "unit": detected.get("unit", g0 + 1),
+                        "factor": detected.get("factor", 999),  # 소음표엔 유해인자 열 없음
+                        "worker": detected.get("worker", g0 + 2),
+                        "form": detected.get("form", g0 + 3),
                     }
 
                 # Loop variables init
@@ -524,7 +502,11 @@ def extract_job_data_impl(pdf_path):
                     f_text = get_col(col_map["factor"])
                     w_text = get_col(col_map["worker"])
                     form_text = get_col(col_map["form"])
-                    
+
+                    # 소음표(나-2): 유해인자 열이 없고 모든 행이 소음 측정이므로 '소음'으로 처리
+                    if is_noise_page:
+                        f_text = "소음"
+
                     # Garbage Filter: 셀 단위 타임스탬프 정리
                     # (행 전체에 측정시각(~15:51)이 있다고 통째로 버리면, 같은 행에 실린
                     #  단위작업명 연장부분/근로자수/유해인자 뒷부분이 함께 사라진다.
@@ -672,24 +654,6 @@ def extract_job_data_impl(pdf_path):
                             if jobs[current_group]:
                                 target_cat = cat if cat else "기타"
                                 jobs[current_group][-1]["factors"][target_cat].add(combined)
-
-    # 소음 결과표(나-2)에서 수집한 공정에 물리적인자(소음) 추가
-    for grp, info in noise_info.items():
-        if not grp or grp in ("공정", "부서", "부서 또는", "단위작업장소"):
-            continue
-        if grp in jobs and jobs[grp]:
-            jobs[grp][0]["factors"]["물리적인자"].add("소음")
-        else:
-            # 소음 표에만 존재하는 공정 -> 최소 항목 생성
-            entry = {
-                "group": grp,
-                "name_parts": [info.get("unit")] if info.get("unit") else [],
-                "factors": defaultdict(set),
-                "workers": info.get("worker", ""),
-                "work_form": set(),
-            }
-            entry["factors"]["물리적인자"].add("소음")
-            jobs[grp].append(entry)
 
     # Post-process: 단위작업명 정리 + 페이지에 걸쳐 쪼개진/중복된 단위 병합
     final_jobs = defaultdict(list)
