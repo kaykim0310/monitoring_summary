@@ -453,31 +453,53 @@ def extract_job_data_impl(pdf_path):
 
 
                 # 1. Detect Header
-                header_found = False
-                for row in table[:5]:
-                    if not row: continue
-                    row_str = "".join([str(x) for x in row if x])
-                    if "공정" in row_str and ("작업" in row_str or "장소" in row_str):
-                        for cb_idx, cell in enumerate(row):
-                            if not cell: continue
-                            txt = str(cell).replace(" ", "")
-                            if "공정" in txt or "부서" in txt: col_map["group"] = cb_idx
-                            elif "작업" in txt or "장소" in txt or "단위" in txt: col_map["unit"] = cb_idx
-                            elif "유해" in txt or "인자" in txt: col_map["factor"] = cb_idx
-                            elif "자수" in txt or "인원" in txt or ("근로" in txt and "자명" not in txt and "시간" not in txt and "형태" not in txt):
-                                # "근로자수" matches "자수" and "근로".
-                                # "근로자명" matches "근로" but has "자명".
-                                # "실제근로시간" matches "근로" but has "시간".
-                                # "근로형태" matches "근로" but has "형태".
-                                # Strict priority: If already set by "자수", don't overwrite with vague "근로".
-                                if "자수" in txt or "인원" in txt:
-                                     col_map["worker"] = cb_idx
-                                elif "worker" not in col_map: # Only set if empty
-                                     col_map["worker"] = cb_idx
-                            elif "형태" in txt or "근무" in txt: col_map["form"] = cb_idx
-                        header_found = True
+                # 헤더 라벨이 여러 행에 흩어져 있고(예: '유해인자'가 별도 행),
+                # 보고서 양식마다 컬럼 위치/개수가 다르다. 따라서 '실제 데이터 행'이
+                # 나오기 전까지의 헤더 행 텍스트를 컬럼별로 합쳐서 각 열의 종류를
+                # 판별한다. (한 행만 보면 '유해인자' 열을 놓쳐 엉뚱한 열을 읽게 됨)
+                header_words = {
+                    "공정명", "공정", "부서또는", "부서", "단위", "단위작업장소", "작업장소",
+                    "유해인자", "근로", "근로형태및", "실제근로시간", "근로자수", "자수",
+                    "측정", "측정위치", "측정치", "측정농도", "발생시간", "발생형태및",
+                    "노출", "노출기준", "평가결과", "비고", "횟수", "기준", "전회", "금회",
+                    "방법", "주기", "근로자명", "(근로자명)", "시작", "종료",
+                }
+                col_text = {}
+                for row in table:
+                    if not row:
+                        continue
+                    c0 = str(row[0]).replace("\n", "").replace(" ", "") if row[0] else ""
+                    # col0에 실제 공정명이 나오면 헤더 영역 종료
+                    if c0 and c0 not in header_words and "twa" not in c0.lower():
                         break
-                
+                    for idx, cell in enumerate(row):
+                        if cell:
+                            col_text[idx] = col_text.get(idx, "") + str(cell).replace("\n", "").replace(" ", "")
+
+                detected = {}
+                for idx, txt in col_text.items():
+                    if "유해" in txt or "인자" in txt:
+                        detected["factor"] = idx
+                    elif "자수" in txt or "인원" in txt:
+                        detected["worker"] = idx
+                    elif "형태" in txt or "근무" in txt:
+                        detected["form"] = idx
+                    elif "작업장소" in txt or "단위" in txt:
+                        detected["unit"] = idx
+                    elif "공정" in txt or "부서" in txt:
+                        detected["group"] = idx
+
+                header_found = ("factor" in detected and "group" in detected)
+                if header_found:
+                    # 이 표 기준으로 컬럼 매핑을 새로 설정(이전 표 값 잔류 방지)
+                    col_map = {
+                        "group": detected.get("group", 0),
+                        "unit": detected.get("unit", detected.get("group", 0) + 1),
+                        "factor": detected["factor"],
+                        "worker": detected.get("worker", detected["factor"] + 1),
+                        "form": detected.get("form", detected["factor"] + 2),
+                    }
+
                 # Loop variables init
                 last_group = None
                 last_job = None
