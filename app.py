@@ -1,53 +1,9 @@
 import streamlit as st
 import os
-import hmac
 from pdf_summary_converter import convert_pdf_to_txt
 import tempfile
 
 st.set_page_config(page_title="PDF 작업환경측정 요약 프로그램", layout="wide")
-
-
-def _expected_password():
-    """접근 비밀번호: 배포 환경변수(APP_PASSWORD) 우선, 없으면 secrets.toml."""
-    pw = os.environ.get("APP_PASSWORD")
-    if pw:
-        return pw
-    try:
-        return st.secrets["APP_PASSWORD"]
-    except Exception:
-        return ""
-
-
-def check_password():
-    """비밀번호가 맞아야 앱을 사용할 수 있게 하는 접근 제한 게이트."""
-    expected = _expected_password()
-
-    # 관리자가 비밀번호를 설정하지 않았으면 접근 차단(코드에 비밀번호를 두지 않음)
-    if not expected:
-        st.title("🔒 접근 제한")
-        st.error("접근 비밀번호가 설정되지 않았습니다. 관리자에게 문의하세요.\n\n"
-                 "(배포 환경에 `APP_PASSWORD` 환경변수를 설정해야 합니다.)")
-        st.stop()
-
-    if st.session_state.get("password_ok", False):
-        return True
-
-    def _on_submit():
-        if hmac.compare_digest(st.session_state.get("password", ""), expected):
-            st.session_state["password_ok"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_ok"] = False
-
-    st.title("🔒 접근 제한")
-    st.text_input("비밀번호를 입력하세요", type="password",
-                  on_change=_on_submit, key="password")
-    if "password_ok" in st.session_state and not st.session_state["password_ok"]:
-        st.error("비밀번호가 올바르지 않습니다.")
-    st.stop()
-
-
-check_password()
 
 st.title("📄 작업환경측정 결과 PDF 요약 변환기")
 st.markdown("""
