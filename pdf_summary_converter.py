@@ -723,168 +723,86 @@ def extract_job_data_impl(pdf_path):
 def extract_job_data(pdf_path):
     return extract_job_data_impl(pdf_path)
 
+CATEGORY_ORDER = ["물리적인자", "분진류", "금속류", "유기화합물",
+                  "산 및 알칼리류", "금속가공유", "기타"]
+CATEGORY_DISP = {
+    "물리적인자": "물리적인자 :",
+    "분진류":     "분진류     :",
+    "금속류":     "금속류     :",
+    "유기화합물": "유기화합물 :",
+    "산 및 알칼리류": "산 및 알칼리류 :",
+    "금속가공유": "금속가공유 :",
+    "기타":       "기타       :",
+}
+
+
 def convert_pdf_to_txt(pdf_path):
     company_info, jobs = extract_job_data(pdf_path)
-    
+
+    company = company_info.get("name", "OOO회사")
+    project_name = company_info.get("project", "OOOO 공사")
+
+    SEP = " " + "-" * 93
+
     lines = []
+    # 표제 (회사/공사 안내)
     lines.append("-" * 93)
-    
-    company = company_info.get("name", "OOO회사") # Default to generic
-    if company and "(주)" not in company and "동양" not in company and "건설" in company: 
-         # Simple heuristic, but safer to just use what is found or generic
-         pass
-    
-    project_name = company_info.get("project", "OOOO 공사") # Generic default
-    
     lines.append(f"■ {company} {project_name}에 대한 공정별 작업내용과")
     lines.append(f"   작업환경측정 대상 유해인자는 다음과 같습니다.")
     lines.append("-" * 93)
-    
-    lines.append("-" * 93)
-    
-    # lines.append("□ 공사개요")
-    # lines.append(f"   ◆ 공 사 명: {project_name}")
-    # lines.append(f"   ◆ 착공일자: 20  .   .   .") 
-    # lines.append(f"   ◆ 준공일자: 20  .   .   .(예정)")
-    # lines.append(f"   ◇ 특이사항: 공사현장의 경우 공기에 따라 작업내용이 달라질 수 있으므로 작업환경측정 당일") 
-    # lines.append(f"                진행되는 작업을 대상으로 작업환경측정을 실시함.")
-    # lines.append("-" * 93)
-    
-    # 계층적 출력
-    # jobs: group -> list of unit objects
-    # Refined Logic based on Example File:
-    # 1. Group by "Group Name" (e.g. 목공, 사면보강) -> This is the main block "■ 목공"
-    # 2. Inside the block:
-    #    ◇ 작업내용 : Combine names of units (e.g. 비계, 거푸집조립 및 해체...)
-    #    ◇ 유해인자 : Merge all factors for this group
-    #    ◇ 근무현황 : List distinct worker entries, formatted like "UnitName (N명, Form)" if multiple, or just "N명, Form" if single/uniform.
-    
+    lines.append("")
+
+    # 단위작업장소(팀)별 개별 블록 출력: ◆ 직장; 팀
     for group_name, unit_list in jobs.items():
-        if not group_name: continue
-        # Filter out Header Groups
-        if group_name == "공정" or group_name == "부서" or group_name == "단위작업장소": continue
-        
-        # Valid Units Filter
-        valid_units = []
+        if not group_name:
+            continue
+        if group_name in ("공정", "부서", "단위작업장소"):
+            continue
+
         for u in unit_list:
-            full_name = "".join(u["name_parts"]).strip()
+            unit_name = "".join(u["name_parts"]).strip() or u.get("job_content", "")
             w_str = str(u["workers"])
-            if re.search(r'\d{2}:\d{2}', w_str): continue # detailed timestamp filter
-            
-            if not full_name:
-                if not u["factors"] and not w_str: continue
-                full_name = "(공정명 없음)"
-            if full_name == "(공정명 없음)" and (not w_str or w_str.strip() == ""): continue
-            
-            u["job_content"] = full_name 
-            valid_units.append(u)
-            
-        if not valid_units: continue
+            if re.search(r'\d{2}:\d{2}', w_str):
+                continue  # 측정시각이 근로자수에 잘못 들어온 잡음 항목 제거
 
-        # Start Output Block
-        lines.append(f"■ {group_name}")
-        lines.append("-" * 93)
-        
-        # 1. 작업내용 Merge AND/OR Listing
-        # Example uses commas: "비계, 거푸집조립 및 해체, 기타 공사용 목공작업"
-        # We can collect unique names
-        unique_names = []
-        seen_names = set()
-        for u in valid_units:
-            nm = u["job_content"]
-            if nm and nm != "(공정명 없음)" and nm not in seen_names:
-                unique_names.append(nm)
-                seen_names.add(nm)
-        
-        content_str = ", ".join(unique_names)
-        if not content_str: content_str = group_name # Fallback
-        
-        lines.append(f"   ◇ 작업내용 : {content_str}")
-        lines.append("")
-        
-        # 2. 유해인자 Merge
-        merged_factors = defaultdict(set)
-        for u in valid_units:
-            for cat, f_set in u["factors"].items():
-                merged_factors[cat].update(f_set)
-                
-        category_order = ["물리적인자", "분진류", "금속류", "유기화합물", "산 및 알칼리류", "금속가공유", "기타"]
-        has_factors = any(merged_factors[cat] for cat in category_order)
-        
-        if has_factors:
-            lines.append("   ◇ 유해인자 :")
-            current_line_idx = len(lines) - 1
-            is_first = True
-            
-            for cat in category_order:
-                if cat in merged_factors and merged_factors[cat]:
-                    factors = sorted(list(merged_factors[cat]))
-                    factors_str = ", ".join(factors)
-                    
-                    if cat == "물리적인자": cat_disp = "물리적인자 :"
-                    elif cat == "분진류":     cat_disp = "분진류     :"
-                    elif cat == "금속류":     cat_disp = "금속류     :"
-                    elif cat == "유기화합물": cat_disp = "유기화합물 :"
-                    elif cat == "금속가공유": cat_disp = "금속가공유 :"
-                    else:                     cat_disp = f"{cat:<10} :"
-                    
+            has_factors = any(u["factors"].get(cat) for cat in CATEGORY_ORDER)
+            if not unit_name and not has_factors and not w_str:
+                continue
+
+            # 블록 제목: "직장; 팀" (팀명이 없으면 직장명만)
+            title = f"{group_name}; {unit_name}" if unit_name else group_name
+            lines.append(SEP)
+            lines.append(f" ◆ {title}")
+            lines.append(SEP)
+
+            # 유해인자 (카테고리별)
+            if has_factors:
+                is_first = True
+                for cat in CATEGORY_ORDER:
+                    fset = u["factors"].get(cat)
+                    if not fset:
+                        continue
+                    factors_str = ", ".join(sorted(fset))
+                    disp = CATEGORY_DISP.get(cat, f"{cat} :")
                     if is_first:
-                         lines[current_line_idx] = f"   ◇ 유해인자 : * {cat_disp} {factors_str}"
-                         is_first = False
+                        lines.append(f"    ◇ 유해인자 : * {disp} {factors_str}")
+                        is_first = False
                     else:
-                         lines.append(f"                 * {cat_disp} {factors_str}")
-            lines.append("")
+                        lines.append(f"                  * {disp} {factors_str}")
+                lines.append("")
 
-        # 3. 근무현황 Listing
-        # Example Style 1: "13명, 1조1교대" (Simple)
-        # Example Style 2: "격자블록설치 (6명, 1조1교대) \n : 낙석방지망설치(3명...)" (Detailed)
-        
-        # Check if basic aggregation is possible (all same form? names correlate?)
-        # Let's collect lines
-        worker_lines = []
-        for u in valid_units:
-            nm = u["job_content"]
+            # 근무현황: "N명, 근로형태" (실제근로시간 '480분'은 제외)
             w = u["workers"]
-            forms = ", ".join(sorted(list(u["work_form"])))
-            
+            forms = [x for x in sorted(u["work_form"]) if "분" not in str(x)]
+            form_str = ", ".join(forms)
             info = ""
-            if w: info += f"{w}명" if str(w).isdigit() else f"{w}"
-            if forms: 
-                if info: info += f", {forms}"
-                else: info = forms
-            
-            if not info: continue
-            
-            worker_lines.append((nm, info))
+            if w:
+                info = f"{w}명" if str(w).isdigit() else f"{w}"
+            if form_str:
+                info = f"{info}, {form_str}" if info else form_str
+            lines.append(f"    ◇ 근무현황 : {info}")
 
-        if worker_lines:
-            # Force Detailed Output for consistency
-            is_first_print = True
-            for nm, info in worker_lines:
-                # If Name is strictly same as group, we might want to hide it, 
-                # BUT user complaints suggest they want explicit naming context.
-                # Only hide if strictly "(공정명 없음)"
-                
-                disp_name = nm
-                if nm == "(공정명 없음)":
-                    disp_name = ""
-                    
-                # Format: "Name (Info)"
-                # If Name is empty, just "(Info)"? Or "Info"?
-                # Standard: "(Info)" if no name.
-                
-                content = ""
-                if disp_name:
-                    content = f"{disp_name:<13}({info})"
-                else:
-                    content = f"({info})"
-                
-                prefix = "   ◇ 근무현황 :" if is_first_print else "                 :"
-                lines.append(f"{prefix} {content}")
-                is_first_print = False
-        
-        lines.append("-" * 93)
-
+    lines.append(SEP)
     return "\n".join(lines)
 
 if __name__ == "__main__":
