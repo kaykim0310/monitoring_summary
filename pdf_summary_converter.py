@@ -76,6 +76,63 @@ def classify_factor(factor_name):
     return "기타"
 
 # ---------------------------------------------------------------------------
+# 유해인자명 줄바꿈 재조립
+#   PDF 셀 안에서 긴 물질명이 줄바꿈되면 text 전략에서 두 조각으로 나뉜다.
+#   (예: '1,1-디클로로-1-플루' + '오로에탄') 괄호 균형만으로는 괄호 없는
+#   줄바꿈을 못 잡으므로, 공식 유해인자 목록(factor_reference)을 기준
+#   사전으로 삼아 조각을 원래 물질명으로 합친다.
+# ---------------------------------------------------------------------------
+try:
+    from factor_reference import KNOWN_FACTOR_NAMES, KNOWN_FACTOR_TOKENS
+except ImportError:
+    KNOWN_FACTOR_NAMES = frozenset()
+    KNOWN_FACTOR_TOKENS = frozenset()
+
+
+def _norm_factor(s):
+    return re.sub(r"\s+", "", s or "")
+
+
+def _is_known_factor(s):
+    n = _norm_factor(s)
+    return n in KNOWN_FACTOR_NAMES or n in KNOWN_FACTOR_TOKENS
+
+
+def _should_join_factor(a, b):
+    """유해인자명 조각 a 뒤에 오는 b가 줄바꿈으로 잘린 꼬리인지 판정."""
+    if not a or not b:
+        return False
+    # 1) 여는 괄호가 아직 안 닫힘 -> 무조건 이어붙임
+    if a.count("(") > a.count(")"):
+        return True
+    na, nb = _norm_factor(a), _norm_factor(b)
+    nab = na + nb
+    # 2) 합치면 공식 유해인자명 (예: '1,1-디클로로-1-플루'+'오로에탄')
+    if nab in KNOWN_FACTOR_NAMES:
+        return True
+    # 3) 아직 공식 명칭을 만들어가는 중 (a가 미완성 접두어)
+    if na not in KNOWN_FACTOR_NAMES and any(k.startswith(nab) for k in KNOWN_FACTOR_NAMES):
+        return True
+    # 4) b가 짧은 순한글 조각이고, 그 자체로 알려진 물질명/토큰도 아니고,
+    #    키워드 분류도 안 되면(=독립 물질로 볼 근거가 없으면) 잘린 꼬리로 간주
+    #    (예: '산화규소-비결정체-실'+'리카겔', '메틸렌 비스페닐디이'+'소시아네이트')
+    #    반면 '산화철분진과흄'처럼 자체 분류되는 조각은 독립 물질이므로 합치지 않음.
+    if (re.fullmatch(r"[가-힣]+", b) and len(b) <= 8
+            and not _is_known_factor(b) and na not in KNOWN_FACTOR_NAMES
+            and classify_factor(b) in (None, "기타")):
+        return True
+    return False
+
+
+def _commit_factor(entry, name):
+    """완성된 유해인자명을 해당 단위작업 항목에 분류·기록."""
+    if not entry or not name:
+        return
+    cat = classify_factor(name) or "기타"
+    entry["factors"][cat].add(name)
+
+
+# ---------------------------------------------------------------------------
 # 공정명(그룹) 줄바꿈 보정용 유틸리티
 #   text 전략은 '소재양산 QA그룹'처럼 긴 공정명이 '소재양산 QA' + '그룹'으로
 #   행이 쪼개져 별도 공정으로 잘못 인식된다. 표 괘선(lines) 전략으로 추출한
@@ -481,7 +538,8 @@ def extract_job_data_impl(pdf_path):
                 # Loop variables init
                 last_group = None
                 last_job = None
-                factor_buf = ""   # 괄호로 줄바꿈된 유해인자명 재조립용 버퍼
+                factor_buf = ""          # 줄바꿈으로 잘린 유해인자명 재조립 버퍼
+                factor_buf_entry = None  # 버퍼가 속한 단위작업 항목
 
                 for row in table:
                     if not row or len(row) < 3: continue
@@ -599,6 +657,15 @@ def extract_job_data_impl(pdf_path):
                         is_new_unit_row = False
                         should_merge_prev = True
 
+                    # 단위작업명이 괄호 중간에서 줄바꿈된 경우
+                    # (예: '신소재정비팀(' + '구 FRP2팀)') -> 새 단위가 아니라
+                    # 직전 단위명의 연속이므로 병합한다.
+                    if is_new_unit_row and jobs[current_group]:
+                        prev_name = "".join(jobs[current_group][-1]["name_parts"])
+                        if prev_name.count("(") > prev_name.count(")"):
+                            is_new_unit_row = False
+                            should_merge_prev = True
+
                     if is_new_unit_row:
                         # Prepare workers: if empty, inherit
                         use_workers = w_text
@@ -613,8 +680,11 @@ def extract_job_data_impl(pdf_path):
                             "work_form": set()
                         }
                         if form_text: entry["work_form"].add(form_text)
+                        # 새 단위작업 시작 -> 이전 단위의 미완성 유해인자 버퍼 확정
+                        _commit_factor(factor_buf_entry, factor_buf)
+                        factor_buf = ""
+                        factor_buf_entry = None
                         jobs[current_group].append(entry)
-                        factor_buf = ""   # 새 단위작업 시작 -> 유해인자 버퍼 초기화
                     else:
                         if not jobs[current_group]:
                              # Edge case: No start unit but data implies continuation? 
@@ -639,21 +709,23 @@ def extract_job_data_impl(pdf_path):
 
                              if form_text: entry["work_form"].add(form_text)
 
-                    # Extract factors (괄호 기준으로 줄바꿈된 유해인자명 재조립)
-                    if f_text:
+                    # Extract factors: 줄바꿈으로 잘린 유해인자명 재조립
+                    # (괄호 균형 + 공식 유해인자 목록 기반 _should_join_factor 판정)
+                    if f_text and jobs[current_group]:
+                        cur_entry = jobs[current_group][-1]
                         for sub in re.split(r'[\n]', f_text):
                             sub = sub.strip()
                             if not sub: continue
-                            combined = (factor_buf + sub) if factor_buf else sub
-                            # 여는 괄호가 아직 안 닫혔으면 다음 조각과 이어붙임
-                            if combined.count("(") > combined.count(")"):
-                                factor_buf = combined
+                            if factor_buf and _should_join_factor(factor_buf, sub):
+                                factor_buf += sub
                                 continue
-                            factor_buf = ""
-                            cat = classify_factor(combined)
-                            if jobs[current_group]:
-                                target_cat = cat if cat else "기타"
-                                jobs[current_group][-1]["factors"][target_cat].add(combined)
+                            # 이어붙일 수 없으면 이전 버퍼를 확정하고 새 버퍼 시작
+                            _commit_factor(factor_buf_entry, factor_buf)
+                            factor_buf = sub
+                            factor_buf_entry = cur_entry
+
+                # 표 종료 -> 남은 유해인자 버퍼 확정
+                _commit_factor(factor_buf_entry, factor_buf)
 
     # Post-process: 단위작업명 정리 + 페이지에 걸쳐 쪼개진/중복된 단위 병합
     final_jobs = defaultdict(list)
