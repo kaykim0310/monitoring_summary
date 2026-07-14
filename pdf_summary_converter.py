@@ -179,13 +179,28 @@ def build_canonical_groups(pdf):
             for r in t:
                 if not r or not r[0]:
                     continue
-                g = str(r[0]).replace("\n", "").strip()
-                if _is_group_junk(g):
-                    continue
-                gn = _norm_group(g)
-                if gn not in seen:
-                    seen.add(gn)
-                    cand.append(g)
+                # 통짜 연결 후보(기본) + 괄호로 이어진 '다중 줄' 재조립 조각 후보
+                # (예: '기관학부(용\n접실습)\n기관학부' -> 통짜 + '기관학부(용접실습)')
+                # 단일 줄 조각('소재양산 QA', '그룹')을 후보로 넣으면 통짜
+                # '소재양산 QA그룹'이 세그먼트 규칙에 제거되므로 넣지 않는다.
+                g_lines = [ln.strip() for ln in str(r[0]).split("\n") if ln.strip()]
+                pieces, buf, nlines = ["".join(g_lines)], "", 0
+                for ln in g_lines:
+                    buf = buf + ln if buf else ln
+                    nlines += 1
+                    if buf.count("(") > buf.count(")"):
+                        continue
+                    if nlines > 1 and buf != pieces[0]:
+                        pieces.append(buf)
+                    buf = ""
+                    nlines = 0
+                for g in pieces:
+                    if _is_group_junk(g):
+                        continue
+                    gn = _norm_group(g)
+                    if gn not in seen:
+                        seen.add(gn)
+                        cand.append(g)
 
     # 짧은 것부터 보며, 이미 확보한 공정명들의 연결로 만들어지는 후보(여러 공정이
     # 한 셀에 합쳐진 행)는 제외하고 '원자' 공정명만 남긴다.
@@ -209,11 +224,22 @@ def build_canonical_groups(pdf):
     # 여러 공정이 한 셀에 합쳐진 '병합 공정명'(예: '장비운전원보통인부',
     # '목공사면보강...')은 다른 공정명을 접두/접미로 포함한다. 이런 항목은
     # 신뢰할 수 없으므로 제거한다. (이 경우 text 전략 원본값으로 폴백)
+    # 단, '기관학부(용접실습)'처럼 다른 공정명 + 괄호 수식어 형태는
+    # 병합이 아니라 독립 공정명이므로 유지한다.
     cleaned = []
     for a in atoms:
         an = _norm_group(a)
-        merged = any(b != a and (an.startswith(_norm_group(b)) or an.endswith(_norm_group(b)))
-                     for b in atoms)
+        merged = False
+        for b in atoms:
+            if b == a:
+                continue
+            bn = _norm_group(b)
+            if an.startswith(bn) and not an[len(bn):].startswith("("):
+                merged = True
+                break
+            if an.endswith(bn) and not an.startswith(bn):
+                merged = True
+                break
         if not merged:
             cleaned.append(a)
     return cleaned
@@ -247,6 +273,26 @@ def map_group_name(g, state, canon, canon_norm):
     # 3) 사전에 없으면 조각 그대로 새 공정
     state["canon"] = g
     return g
+
+
+def _fragment_run_match(s, frags):
+    """s가 frags(반대쪽 표의 단위명 조각들)의 '연속 조각 2개 이상'을
+    경계에 맞춰 정확히 이어붙인 것인지 검사.
+    (경계를 무시한 단순 부분문자열 검사는 서로 다른 단위명에 걸친
+    우연한 일치를 만들므로 반드시 조각 경계에 정렬되어야 한다.)"""
+    if not s or not frags:
+        return False
+    for i in range(len(frags)):
+        if not frags[i] or not s.startswith(frags[i]):
+            continue
+        rest = s[len(frags[i]):]
+        k = i + 1
+        while rest and k < len(frags) and frags[k] and rest.startswith(frags[k]):
+            rest = rest[len(frags[k]):]
+            k += 1
+        if not rest and k > i + 1:
+            return True
+    return False
 
 
 def resolve_noise_group(g, canon, canon_norm):
@@ -471,6 +517,11 @@ def extract_job_data_impl(pdf_path):
         canonical_norm = [_norm_group(c) for c in canonical]
         canon_state = {"canon": None, "matched": ""}
 
+        # 그룹별·표별 단위작업명 조각 풀 (나-1/나-2 교차검증용)
+        # 같은 단위명이라도 두 표에서 줄바꿈 위치가 달라, 반대쪽 표의 조각 연결에
+        # A+B가 통째로 존재하면 A,B는 한 이름이 잘린 조각임을 검증할 수 있다.
+        unit_pools = {"na1": defaultdict(list), "na2": defaultdict(list)}
+
         for page in pdf.pages:
             page_text = page.extract_text() or ""
             # 나-2 "결과(소음)" 페이지 식별. 나-1은 "결과(소음 제외)"이므로 제외.
@@ -540,6 +591,10 @@ def extract_job_data_impl(pdf_path):
                 last_job = None
                 factor_buf = ""          # 줄바꿈으로 잘린 유해인자명 재조립 버퍼
                 factor_buf_entry = None  # 버퍼가 속한 단위작업 항목
+                pending_unit_parts = []  # 공정명 행보다 먼저 나온 단위명 조각 보관
+                pending_forms = set()
+                carry_unit_parts = []    # 공정 확정 후 첫 단위 항목에 붙일 선행 조각
+                carry_forms = set()
 
                 for row in table:
                     if not row or len(row) < 3: continue
@@ -613,7 +668,29 @@ def extract_job_data_impl(pdf_path):
                     else:
                         current_group = last_group
 
-                    if not current_group: continue
+                    if not current_group:
+                        # 공정명이 아직 안 나온 행의 단위명 조각은 버리지 말고 보관
+                        # (예: '손상통제학과/용' 행 다음 행에 '기관학부(용'이 나오는 배치)
+                        if u_text:
+                            pending_unit_parts.append(u_text)
+                        if form_text:
+                            pending_forms.add(form_text)
+                        continue
+
+                    # 보관해둔 선행 단위명 조각을 풀에 먼저 반영하고 항목 생성 시 소비 대기
+                    if pending_unit_parts:
+                        _pool = unit_pools["na2" if is_noise_page else "na1"][current_group]
+                        for _p in pending_unit_parts:
+                            _pool.append(re.sub(r"\s+", "", _p))
+                        carry_unit_parts = pending_unit_parts
+                        carry_forms = pending_forms
+                        pending_unit_parts = []
+                        pending_forms = set()
+
+                    # 교차검증용 단위명 조각 수집 (표 종류별)
+                    if u_text:
+                        unit_pools["na2" if is_noise_page else "na1"][current_group].append(
+                            re.sub(r"\s+", "", u_text))
 
                     # Determine if this row starts a new unit
                     is_new_unit_row = False
@@ -674,11 +751,15 @@ def extract_job_data_impl(pdf_path):
 
                         entry = {
                             "group": current_group,
-                            "name_parts": [u_text] if u_text else [],
+                            "name_parts": carry_unit_parts + ([u_text] if u_text else []),
                             "factors": defaultdict(set),
                             "workers": use_workers if use_workers else "",
-                            "work_form": set()
+                            "work_form": set(carry_forms),
+                            "src": "na2" if is_noise_page else "na1",
+                            "own_worker": bool(w_text),
                         }
+                        carry_unit_parts = []
+                        carry_forms = set()
                         if form_text: entry["work_form"].add(form_text)
                         # 새 단위작업 시작 -> 이전 단위의 미완성 유해인자 버퍼 확정
                         _commit_factor(factor_buf_entry, factor_buf)
@@ -691,11 +772,15 @@ def extract_job_data_impl(pdf_path):
                              # Create fallback unit
                              entry = {
                                 "group": current_group,
-                                "name_parts": [u_text] if u_text else [],
+                                "name_parts": carry_unit_parts + ([u_text] if u_text else []),
                                 "factors": defaultdict(set),
                                 "workers": w_text if w_text else "",
-                                "work_form": set()
+                                "work_form": set(carry_forms),
+                                "src": "na2" if is_noise_page else "na1",
+                                "own_worker": bool(w_text),
                              }
+                             carry_unit_parts = []
+                             carry_forms = set()
                              if form_text: entry["work_form"].add(form_text)
                              jobs[current_group].append(entry)
                         else:
@@ -764,6 +849,39 @@ def extract_job_data_impl(pdf_path):
                 if nkey == ckey or nkey in ckey or ckey in nkey:
                     target = c
                     break
+
+            # 교차검증 병합: 직전 단위 A와 이번 단위 B가 같은 표에서 나왔고,
+            # B가 자체 근로자수 없이 상속받았으며, A+B 연결이 '반대쪽 표'의
+            # 단위명 조각 연결 속에 통째로 존재하면 -> A,B는 한 이름이 잘린 조각.
+            # (같은 표의 두 표에서 줄바꿈 위치가 달라 교차검증이 가능)
+            # 단, A나 B가 반대쪽 표에 독립 조각으로 그대로 존재하면 별개 단위로 본다.
+            extend_prev = False
+            extend_text = full_name
+            if target is None and consolidated:
+                prev = consolidated[-1]
+                if prev.get("src") and prev.get("src") == u.get("src"):
+                    opp = "na1" if u["src"] == "na2" else "na2"
+                    opp_frags = unit_pools[opp].get(grp, [])
+                    pk = re.sub(r"\s+", "", prev["job_content"])
+                    # A+B가 반대쪽 표의 '연속 조각 2개 이상'과 경계까지 정확히
+                    # 일치할 때만 병합 (경계 무시 부분문자열은 오병합 위험).
+                    # ov=1은 pdfplumber가 경계 글자를 양쪽 조각에 중복 부여한
+                    # 경우('영접사격장/통제'+'제실(교관)') 보정.
+                    # pk(또는 nkey)가 '단독으로' 반대쪽 조각 run과 완결 일치하면
+                    # 그 자체로 완성된 단위명이므로 병합하지 않는다.
+                    # (예: 롯데 'ABS중합(F/CBag)1/포장' = na2의 'ABS중합(F/C'+'Bag)1/포장')
+                    if (pk and nkey and nkey not in opp_frags and pk not in opp_frags
+                            and not _fragment_run_match(pk, opp_frags)
+                            and not _fragment_run_match(nkey, opp_frags)):
+                        for ov in (0, 1):
+                            if ov and (len(nkey) <= ov or pk[-1:] != nkey[:1]):
+                                continue
+                            if _fragment_run_match(pk + nkey[ov:], opp_frags):
+                                target = prev
+                                extend_prev = True
+                                extend_text = full_name[ov:]
+                                break
+
             if target is None:
                 # 새 단위 (factors를 합치기 좋게 복사)
                 new_u = {
@@ -772,13 +890,19 @@ def extract_job_data_impl(pdf_path):
                     "factors": defaultdict(set),
                     "workers": u["workers"],
                     "work_form": set(u["work_form"]),
+                    "src": u.get("src"),
+                    "own_worker": u.get("own_worker", False),
                 }
                 for c, s in u["factors"].items():
                     new_u["factors"][c] |= s
                 consolidated.append(new_u)
             else:
-                # 더 긴(완전한) 이름 채택
-                if len(re.sub(r"\s+", "", full_name)) > len(re.sub(r"\s+", "", target["job_content"])):
+                if extend_prev:
+                    # 잘린 조각 병합: 이름을 이어붙임
+                    target["job_content"] = target["job_content"] + extend_text
+                    target["name_parts"] = [target["job_content"]]
+                elif len(re.sub(r"\s+", "", full_name)) > len(re.sub(r"\s+", "", target["job_content"])):
+                    # 더 긴(완전한) 이름 채택
                     target["job_content"] = full_name
                     target["name_parts"] = list(u["name_parts"])
                 for c, s in u["factors"].items():
