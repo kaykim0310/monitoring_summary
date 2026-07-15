@@ -147,6 +147,18 @@ def _should_join_factor(a, b):
     return False
 
 
+def _join_name_parts(parts):
+    """줄바꿈으로 잘린 이름 조각 결합. 기본은 무공백 결합이되
+    '및' 경계('철근가공 및'+'조립')는 공백을 유지한다."""
+    out = ""
+    for p in parts:
+        if out and (out.endswith("및") or p.startswith("및")):
+            out += " " + p
+        else:
+            out += p
+    return out
+
+
 def _commit_factor(entry, name):
     """완성된 유해인자명을 해당 단위작업 항목에 분류·기록."""
     if not entry or not name:
@@ -189,6 +201,17 @@ def _is_group_junk(c0):
     return any(k.lower() in c0.lower() for k in _GROUP_JUNK_KEYWORDS)
 
 
+_POS_RE = re.compile(r"[PN]\d{1,3}")
+
+
+def _row_has_pos(row):
+    """행에 측정위치 번호(P1, N12 등)가 있는지 — 새 측정 블록 시작 신호."""
+    for c in row:
+        if c and _POS_RE.fullmatch(str(c).replace("\n", "").strip()):
+            return True
+    return False
+
+
 def build_canonical_groups(pdf):
     """표 괘선 전략으로 0열(공정명)을 모아 정식 공정명 목록을 만든다."""
     cand, seen = [], set()
@@ -225,6 +248,45 @@ def build_canonical_groups(pdf):
                         seen.add(gn)
                         cand.append(g)
 
+    # text 전략 스캔: 0열 공정명 조각들을 순회하며, 조각 사이에 측정위치(P/N)
+    # 행이 있으면 서로 다른 공정명, 없으면 같은 이름의 줄바꿈 조각으로 보고
+    # 이어붙여 '완결 공정명' 후보를 얻는다.
+    # (lattice 셀 하나에 여러 공정이 병합된 경우('장비운전원\n보통인부')를
+    #  분리할 근거가 되고, '소재양산 QA'+'그룹'처럼 한 이름의 줄바꿈은
+    #  사이에 P/N 행이 없어 자연히 이어진다.)
+    for page in pdf.pages:
+        try:
+            tables = page.extract_tables(
+                table_settings={"horizontal_strategy": "text"}) or []
+        except Exception:
+            tables = []
+        for t in tables:
+            cur = None
+            seen_pos = False
+            for row in t:
+                if not row:
+                    continue
+                g = str(row[0]).replace("\n", "").strip() if row[0] else ""
+                if g and not _is_group_junk(g):
+                    if cur is None:
+                        cur = g
+                    elif seen_pos:
+                        gn = _norm_group(cur)
+                        if gn not in seen:
+                            seen.add(gn)
+                            cand.append(cur)
+                        cur = g
+                    else:
+                        cur = cur + g
+                    seen_pos = False
+                elif _row_has_pos(row):
+                    seen_pos = True
+            if cur:
+                gn = _norm_group(cur)
+                if gn not in seen:
+                    seen.add(gn)
+                    cand.append(cur)
+
     # 짧은 것부터 보며, 이미 확보한 공정명들의 연결로 만들어지는 후보(여러 공정이
     # 한 셀에 합쳐진 행)는 제외하고 '원자' 공정명만 남긴다.
     cand.sort(key=lambda x: len(_norm_group(x)))
@@ -244,23 +306,22 @@ def build_canonical_groups(pdf):
         atoms.append(g)
         atom_norms.append(gn)
 
-    # 여러 공정이 한 셀에 합쳐진 '병합 공정명'(예: '장비운전원보통인부',
-    # '목공사면보강...')은 다른 공정명을 접두/접미로 포함한다. 이런 항목은
-    # 신뢰할 수 없으므로 제거한다. (이 경우 text 전략 원본값으로 폴백)
-    # 단, '기관학부(용접실습)'처럼 다른 공정명 + 괄호 수식어 형태는
-    # 병합이 아니라 독립 공정명이므로 유지한다.
+    # 여러 공정이 한 셀에 합쳐진 '병합 공정명'(예: '장비운전원보통인부')은
+    # 다른 공정명들의 연결로 완전 분해된다 -> can_segment가 이미 제외.
+    # 남은 애매한 경우: 다른 공정명으로 시작/끝나고 '나머지'도 공정명들로
+    # 완전 분해될 때만 병합으로 보고 제거한다.
+    # ('유도/무장직장'에서 '유도/무장직'을 뺀 나머지 '장'은 공정명이 아니므로
+    #  독립 이름으로 유지, '기관학부(용접실습)'의 '(용접실습)'도 마찬가지)
     cleaned = []
     for a in atoms:
         an = _norm_group(a)
         merged = False
-        for b in atoms:
-            if b == a:
-                continue
-            bn = _norm_group(b)
-            if an.startswith(bn) and not an[len(bn):].startswith("("):
+        others = [_norm_group(b) for b in atoms if b != a]
+        for bn in others:
+            if an.startswith(bn) and can_segment(an[len(bn):], others):
                 merged = True
                 break
-            if an.endswith(bn) and not an.startswith(bn):
+            if an.endswith(bn) and can_segment(an[:-len(bn)], others):
                 merged = True
                 break
         if not merged:
@@ -619,25 +680,45 @@ def extract_job_data_impl(pdf_path):
                 carry_unit_parts = []    # 공정 확정 후 첫 단위 항목에 붙일 선행 조각
                 carry_forms = set()
 
-                for row in table:
+                for row_idx, row in enumerate(table):
                     if not row or len(row) < 3: continue
-                    
+
                     row_full = "".join([str(x) for x in row if x])
                     if "공정" in row_full and "작업" in row_full: continue
-                    if "측정방법" in row_full or "비고" in row_full: continue 
+                    if "측정방법" in row_full or "비고" in row_full: continue
                     if "평균치" in row_full: continue
-                    if "측정시각" in row_full: continue 
+                    if "측정시각" in row_full: continue
 
                     def get_col(idx):
                         if idx < len(row) and row[idx]:
                             return str(row[idx]).replace("\n", " ").strip()
                         return ""
-                    
+
                     g_text = get_col(col_map["group"])
                     u_text = get_col(col_map["unit"])
                     f_text = get_col(col_map["factor"])
                     w_text = get_col(col_map["worker"])
                     form_text = get_col(col_map["form"])
+
+                    # Lookahead: 이 행에 측정위치(P/N) 신호가 있고 공정명이 없는데
+                    # '다음 행'에서 새 공정이 시작되면, 이 행의 단위명/근로형태는
+                    # 이전 공정이 아니라 다음 공정 소속이다.
+                    # (예: '토공정리/되메우기 1조1교대 N14' 행 다음에 '장비운전원' 행)
+                    if not g_text and _row_has_pos(row):
+                        nxt = table[row_idx + 1] if row_idx + 1 < len(table) else None
+                        if nxt:
+                            gi, ui = col_map["group"], col_map["unit"]
+                            nxt_g = (str(nxt[gi]).replace("\n", " ").strip()
+                                     if gi < len(nxt) and nxt[gi] else "")
+                            nxt_u = (str(nxt[ui]).replace("\n", " ").strip()
+                                     if ui < len(nxt) and nxt[ui] else "")
+                            if nxt_g and not _is_group_junk(nxt_g):
+                                if form_text:
+                                    pending_forms.add(form_text)
+                                    form_text = ""
+                                if u_text and not nxt_u:
+                                    pending_unit_parts.append(u_text)
+                                    u_text = ""
 
                     # 소음표(나-2): 유해인자 열이 없고 모든 행이 소음 측정이므로 '소음'으로 처리
                     if is_noise_page:
@@ -679,6 +760,7 @@ def extract_job_data_impl(pdf_path):
                     # Strict Row Separation Logic
                     # 공정명 줄바꿈 보정: g_text를 정식 공정명으로 매핑.
                     group_absorbed = False
+                    group_started = False   # 이 행에서 새 공정이 시작됐는가
                     if g_text:
                         mapped = map_group_name(g_text, canon_state, canonical, canonical_norm)
                         if mapped is None:
@@ -686,6 +768,7 @@ def extract_job_data_impl(pdf_path):
                             group_absorbed = True
                             current_group = last_group
                         else:
+                            group_started = (mapped != last_group)
                             current_group = mapped
                             last_group = mapped
                     else:
@@ -700,8 +783,9 @@ def extract_job_data_impl(pdf_path):
                             pending_forms.add(form_text)
                         continue
 
-                    # 보관해둔 선행 단위명 조각을 풀에 먼저 반영하고 항목 생성 시 소비 대기
-                    if pending_unit_parts:
+                    # 보관해둔 선행 단위명/근로형태 조각은 '새 공정이 시작된 행'에서만
+                    # 소비한다. (이전 공정이 진행 중인 행에서 소비하면 엉뚱한 공정에 붙음)
+                    if group_started and (pending_unit_parts or pending_forms):
                         _pool = unit_pools["na2" if is_noise_page else "na1"][current_group]
                         for _p in pending_unit_parts:
                             _pool.append(re.sub(r"\s+", "", _p))
@@ -845,7 +929,7 @@ def extract_job_data_impl(pdf_path):
 
         consolidated = []  # 같은 공정 내 병합된 단위 목록
         for u in unit_list:
-            full_name = "".join(u["name_parts"]).strip()
+            full_name = _join_name_parts(u["name_parts"]).strip()
 
             # Check for timestamp in worker field (e.g. 07:07) -> Garbage unit
             w_str = str(u["workers"])
@@ -899,7 +983,11 @@ def extract_job_data_impl(pdf_path):
                         for ov in (0, 1):
                             if ov and (len(nkey) <= ov or pk[-1:] != nkey[:1]):
                                 continue
-                            if _fragment_run_match(pk + nkey[ov:], opp_frags):
+                            combined = pk + nkey[ov:]
+                            # 연속 조각 run 일치 또는 반대 표 '단일 조각'과 정확 일치
+                            # (예: na1 '낙석방지망설'+'치' == na2 조각 '낙석방지망설치')
+                            if (_fragment_run_match(combined, opp_frags)
+                                    or combined in opp_frags):
                                 target = prev
                                 extend_prev = True
                                 extend_text = full_name[ov:]
@@ -921,8 +1009,9 @@ def extract_job_data_impl(pdf_path):
                 consolidated.append(new_u)
             else:
                 if extend_prev:
-                    # 잘린 조각 병합: 이름을 이어붙임
-                    target["job_content"] = target["job_content"] + extend_text
+                    # 잘린 조각 병합: 이름을 이어붙임 ('및' 경계는 공백 유지)
+                    target["job_content"] = _join_name_parts(
+                        [target["job_content"], extend_text])
                     target["name_parts"] = [target["job_content"]]
                 elif len(re.sub(r"\s+", "", full_name)) > len(re.sub(r"\s+", "", target["job_content"])):
                     # 더 긴(완전한) 이름 채택
@@ -982,7 +1071,7 @@ def convert_pdf_to_txt(pdf_path):
             continue
 
         for u in unit_list:
-            unit_name = "".join(u["name_parts"]).strip() or u.get("job_content", "")
+            unit_name = _join_name_parts(u["name_parts"]).strip() or u.get("job_content", "")
             w_str = str(u["workers"])
             if re.search(r'\d{2}:\d{2}', w_str):
                 continue  # 측정시각이 근로자수에 잘못 들어온 잡음 항목 제거
