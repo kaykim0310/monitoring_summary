@@ -1049,16 +1049,21 @@ CATEGORY_DISP = {
 
 def convert_pdf_to_txt(pdf_path):
     company_info, jobs = extract_job_data(pdf_path)
+    return render_summary(company_info, jobs)
 
+
+def render_summary(company_info, jobs):
+    """jobs 구조 -> 분포실태 텍스트 (PDF/엑셀 공용 출력 형식)."""
     company = company_info.get("name", "OOO회사")
-    project_name = company_info.get("project", "OOOO 공사")
+    project_name = company_info.get("project", "")
+    title_who = f"{company} {project_name}".strip()
 
     SEP = " " + "-" * 93
 
     lines = []
     # 표제 (회사/공사 안내)
     lines.append("-" * 93)
-    lines.append(f"■ {company} {project_name}에 대한 공정별 작업내용과")
+    lines.append(f"■ {title_who}에 대한 공정별 작업내용과")
     lines.append(f"   작업환경측정 대상 유해인자는 다음과 같습니다.")
     lines.append("-" * 93)
     lines.append("")
