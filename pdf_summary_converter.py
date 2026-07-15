@@ -1031,6 +1031,41 @@ def extract_job_data_impl(pdf_path):
 def extract_job_data(pdf_path):
     return extract_job_data_impl(pdf_path)
 
+import unicodedata
+
+
+def _disp_width(s):
+    """표시 폭 계산 (한글 등 전각 문자는 2칸)."""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+               for c in s)
+
+
+def _wrap_items(prefix, items, max_width=93):
+    """'prefix + 항목, 항목, ...'을 A4 폭에 맞춰 물질 경계에서 줄바꿈.
+
+    이어지는 줄은 목록 시작 위치(prefix의 표시 폭)에 맞춰 들여쓴다.
+    """
+    indent = " " * _disp_width(prefix)
+    lines = []
+    cur = prefix
+    cur_w = _disp_width(prefix)
+    first_in_line = True
+    for i, item in enumerate(items):
+        sep = "" if first_in_line else ", "
+        tail = "," if i < len(items) - 1 else ""
+        item_w = _disp_width(sep + item + tail)
+        if not first_in_line and cur_w + item_w > max_width:
+            lines.append(cur + ",")
+            cur = indent + item
+            cur_w = _disp_width(cur)
+        else:
+            cur += sep + item
+            cur_w += _disp_width(sep + item)
+        first_in_line = False
+    lines.append(cur)
+    return lines
+
+
 CATEGORY_ORDER = ["물리적인자", "분진류", "금속류", "유기화합물",
                   "산 및 알칼리류", "가스상 물질류", "금속가공유",
                   "허가대상 유해물질", "기타"]
@@ -1091,20 +1126,18 @@ def render_summary(company_info, jobs):
             lines.append(f" ◆ {title}")
             lines.append(SEP)
 
-            # 유해인자 (카테고리별)
+            # 유해인자 (카테고리별, A4 폭에 맞춰 물질 경계에서 줄바꿈)
             if has_factors:
                 is_first = True
                 for cat in CATEGORY_ORDER:
                     fset = u["factors"].get(cat)
                     if not fset:
                         continue
-                    factors_str = ", ".join(sorted(fset))
                     disp = CATEGORY_DISP.get(cat, f"{cat} :")
-                    if is_first:
-                        lines.append(f"    ◇ 유해인자 : * {disp} {factors_str}")
-                        is_first = False
-                    else:
-                        lines.append(f"                  * {disp} {factors_str}")
+                    head = "    ◇ 유해인자 : " if is_first else "                  "
+                    prefix = f"{head}* {disp} "
+                    lines.extend(_wrap_items(prefix, sorted(fset)))
+                    is_first = False
                 lines.append("")
 
             # 근무현황: "N명, 근로형태" (실제근로시간 '480분'은 제외)
