@@ -180,7 +180,12 @@ def extract_jobs_from_xls(file_datas):
         return entry
 
     parsed = []
+    shell_detected = False
     for data in file_datas:
+        # Excel '웹 보관 파일' 껍데기 감지: 데이터가 별도 .files 폴더에 분리된 형태
+        if isinstance(data, (bytes, bytearray)) and b"Excel Workbook Frameset" in bytes(data[:2000]):
+            shell_detected = True
+            continue
         # xlsx는 시트별로, HTML-xls는 표별로 각각 판별
         for table in parse_any_tables(data):
             rows, idx = _find_data_table([table])
@@ -190,9 +195,18 @@ def extract_jobs_from_xls(file_datas):
             if kind:
                 parsed.append((kind, rows, idx))
 
-    if not parsed:
-        raise ValueError("표를 찾을 수 없습니다. MES에서 F11로 내려받은 "
-                         "엑셀(소음제외/소음)인지 확인해 주세요.")
+    kinds = {k for k, _, _ in parsed}
+    if "chem" not in kinds:
+        msg = "소음제외(유해인자) 표를 찾지 못해 유해인자를 읽을 수 없습니다."
+        if shell_detected:
+            msg += (" 업로드된 파일 중 데이터가 없는 '껍데기' 파일이 있습니다"
+                    " (Excel에서 '웹 페이지'로 재저장되면 용량 10KB 정도의"
+                    " 껍데기만 남습니다). MES에서 F11로 받은 원본 파일을"
+                    " 수정 없이 그대로 올려주세요.")
+        else:
+            msg += (" MES에서 F11로 받은 소음제외 원본 파일(.xls)을 함께"
+                    " 올렸는지 확인해 주세요.")
+        raise ValueError(msg)
 
     # 소음제외(chem) 먼저 처리해 단위 순서를 잡고, 소음은 뒤에 합류
     parsed.sort(key=lambda x: 0 if x[0] == "chem" else 1)
