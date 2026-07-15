@@ -13,64 +13,85 @@ def clean_text(text):
     return text.replace("\n", " ").strip()
 
 def classify_factor(factor_name):
-    """유해인자 이름을 기반으로 카테고리를 분류합니다 ([별표 12] 참조)."""
+    """유해인자 이름을 카테고리로 분류.
+
+    1순위: 공식 분류 사전(FACTOR_CATEGORY, 별표21 + 측정·분석방법 표에서 생성)
+    2순위: 키워드 휴리스틱 (사전에 없는 표기 변형 대응)
+    """
     factor_name = factor_name.replace("\n", "").strip()
     if not factor_name or factor_name == "유해인자":
         return None
-    
-    # 0. 물리적 인자
-    if "소음" in factor_name or "고열" in factor_name:
+
+    n = re.sub(r"\s+|·", "", factor_name).lower()
+
+    # 1. 사전 정확 일치 (괄호 이후 제거한 기본형 포함)
+    cat = FACTOR_CATEGORY.get(n)
+    if cat:
+        return cat
+    base = re.sub(r"\(.*$", "", n)
+    cat = FACTOR_CATEGORY.get(base)
+    if cat:
+        return cat
+
+    # 2. 사전 키가 이름 안에 포함 (가장 긴 키 우선, 3자 이상)
+    best_key = None
+    for k, c in FACTOR_CATEGORY.items():
+        if len(k) >= 3 and k in n:
+            if best_key is None or len(k) > len(best_key[0]):
+                best_key = (k, c)
+    if best_key:
+        return best_key[1]
+
+    # 3. 키워드 휴리스틱 (사전 미등재 표기 변형 대비)
+    # 물리적 인자
+    if any(x in factor_name for x in ["소음", "고열", "진동", "조도"]):
         return "물리적인자"
-
-    # 1. 금속가공유 (미네랄오일 등) - 별표 12 기준
-    if any(x in factor_name for x in ["미네랄오일", "오일미스트", "금속가공유"]):
+    # 금속가공유
+    if any(x in factor_name for x in ["미네랄오일", "오일미스트", "오일 미스트", "금속가공유"]):
         return "금속가공유"
-
-    # 2. 유기화합물 (가장 많음, 우선순위 높여서 산성 오분류 방지)
-    # 아세톤, 톨루엔, 크실렌(자일렌), 메탄올, 에탄올, 이소프로필알코올, 
-    # 초산메틸/에틸/부틸, 디메틸..., 벤젠, 헥산, 신너, 가솔린, 나프타 등
+    # 유기화합물
     organic_keywords = [
         "아세톤", "톨루엔", "크실렌", "자일렌", "부틸", "에탄올", "메탄올", "이소프로필", "알코올",
-        "초산메틸", "초산에틸", "초산부틸", "초산이소", "초산(아세트산)", "아세트산", # 아세트산은 사실 산류일수도 있지만 유기용제로 주로 분류됨 (별표12 유기화합물 108호 초산 등)
-        "디메틸", "벤젠", "헥산", "신너", "가솔린", "나프타", "와이어", "유기화합물", "트리클로로",
-        "디클로로", "메틸", "에틸", "스티렌", "포름알데히드", "에테르", "케톤", "솔벤트", "세척제", "유기용제"
+        "초산메틸", "초산에틸", "초산부틸", "초산이소", "디메틸", "벤젠", "헥산", "신너", "가솔린",
+        "나프타", "유기화합물", "트리클로로", "디클로로", "메틸", "에틸", "스티렌", "포름알데히드",
+        "에테르", "케톤", "솔벤트", "세척제", "유기용제", "퓨란", "푸란", "니트릴", "피리딘",
+        "글리콜", "아미드", "옥산", "헵탄", "펜탄", "옥탄",
     ]
-    # '초산' 단독은 산류로 분류될 수 있으나, '초산XX'는 유기화합물
     if any(x in factor_name for x in organic_keywords):
-        # 예외: 무기산이 섞여있어서 유기화합물로 분류되면 안되는 경우? (거의 없음)
         return "유기화합물"
-
-    # 3. 산 및 알칼리류
-    acid_alkali_keywords = [
-        "황산", "염산", "질산", "불산", "불소", "수산화", "암모니아", "과산화", "산 및 알칼리", "포르말린" # 포르말린은 알데히드지만 관리상.. 별표12에선 유기화합물(포름알데히드). 여기선 키워드 주의
+    # 가스상 물질류
+    gas_keywords = [
+        "오존", "암모니아", "일산화탄소", "황화수소", "이산화황", "아황산가스", "이산화질소",
+        "일산화질소", "포스핀", "포스겐", "산화에틸렌", "가스",
     ]
-    # 별표12에 포름알데히드는 유기화합물임. 위에서 처리됨.
+    if any(x in factor_name for x in gas_keywords):
+        return "가스상 물질류"
+    # 산 및 알칼리류
+    acid_alkali_keywords = [
+        "황산", "염산", "질산", "불산", "불화수소", "브롬화수소", "염화수소", "시안화",
+        "수산화", "과산화", "개미산", "인산", "알칼리",
+    ]
     if any(x in factor_name for x in acid_alkali_keywords):
         return "산 및 알칼리류"
-    
-    # '산'이 들어가지만 유기가 아닌것 (위에서 유기 다 걸러짐)
-    if "산" in factor_name and not any(x in factor_name for x in ["산화", "탄산", "규산", "초산", "유산", "젖산"]): 
-        # 산화철(금속), 규산(분진), 탄산(가스/분진) 등 제외
-        # 초산은 위에서 유기화합물로 처리 (아세트산)
-        # 하지만 그냥 '산' 글자만으로는 위험. 구체적 산 이름 위주로.
-        pass
-
-    if "알칼리" in factor_name:
-        return "산 및 알칼리류"
-
-    # 4. 금속류
+    # 금속류
     metal_keywords = [
-        "산화철", "망간", "티타늄", "용접흄", "구리", "납", "니켈", "크롬", "아연", "알루미늄", 
-        "카드뮴", "코발트", "주석", "안티몬", "비소", "수은", "금속", "스테인리스", "철분"
+        "산화철", "망간", "티타늄", "구리", "납", "니켈", "크롬", "아연", "알루미늄",
+        "카드뮴", "코발트", "주석", "안티몬", "비소", "수은", "금속", "스테인리스", "철분",
+        "백금", "은(", "셀레늄", "지르코늄", "텅스텐", "몰리브덴", "바나듐", "베릴륨", "마그네슘",
+        "인디움", "인듐",
     ]
     if any(x in factor_name for x in metal_keywords):
         return "금속류"
-
-    # 5. 분진류
+    # 분진류
     dust_keywords = [
-        "분진", "석영", "규소", "시멘트", "광물", "곡물", "목재", "면", "활석", "카본", "유리"
+        "분진", "석영", "규소", "규산", "시멘트", "광물", "곡물", "목재", "활석", "카본",
+        "유리", "석면", "흑연", "카올린", "소우프스톤", "운모", "먼지", "실리카",
+        "리카겔",  # '산화규소-비결정체-실리카겔'이 페이지 경계에서 잘린 꼬리 조각
     ]
     if any(x in factor_name for x in dust_keywords):
+        return "분진류"
+    # 흄류: 금속명이 앞에서 안 걸린 흄은 분진류 (용접 흄, 조리흄 등)
+    if base.endswith("흄") or "흄" in factor_name:
         return "분진류"
 
     return "기타"
@@ -83,10 +104,12 @@ def classify_factor(factor_name):
 #   사전으로 삼아 조각을 원래 물질명으로 합친다.
 # ---------------------------------------------------------------------------
 try:
-    from factor_reference import KNOWN_FACTOR_NAMES, KNOWN_FACTOR_TOKENS
+    from factor_reference import (KNOWN_FACTOR_NAMES, KNOWN_FACTOR_TOKENS,
+                                  FACTOR_CATEGORY)
 except ImportError:
     KNOWN_FACTOR_NAMES = frozenset()
     KNOWN_FACTOR_TOKENS = frozenset()
+    FACTOR_CATEGORY = {}
 
 
 def _norm_factor(s):
@@ -920,14 +943,17 @@ def extract_job_data(pdf_path):
     return extract_job_data_impl(pdf_path)
 
 CATEGORY_ORDER = ["물리적인자", "분진류", "금속류", "유기화합물",
-                  "산 및 알칼리류", "금속가공유", "기타"]
+                  "산 및 알칼리류", "가스상 물질류", "금속가공유",
+                  "허가대상 유해물질", "기타"]
 CATEGORY_DISP = {
     "물리적인자": "물리적인자 :",
     "분진류":     "분진류     :",
     "금속류":     "금속류     :",
     "유기화합물": "유기화합물 :",
     "산 및 알칼리류": "산 및 알칼리류 :",
+    "가스상 물질류":  "가스상 물질류  :",
     "금속가공유": "금속가공유 :",
+    "허가대상 유해물질": "허가대상 유해물질 :",
     "기타":       "기타       :",
 }
 
