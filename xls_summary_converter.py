@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
-"""측정 프로그램이 내보낸 엑셀(HTML-xls) 결과를 분포실태 텍스트로 변환.
+"""측정 프로그램(MES)이 내보낸 엑셀 결과를 분포실태 텍스트로 변환.
 
-측정기관 프로그램의 '엑셀 내보내기'는 확장자만 .xls인 HTML 표 파일이다.
+지원 형식:
+1) MES에서 F11로 받은 원본 엑셀(.xls) — 확장자만 .xls인 HTML 표 파일
+2) 위 2개를 시트 2개로 합쳐 저장한 통합 문서(.xlsx)
+
 셀 값이 온전히 저장되어 있어 PDF와 달리 줄바꿈 잘림·컬럼 추측이 필요 없고,
 '물질분류' 열이 있으면 그 분류를 그대로 사용한다.
 
-- 소음제외 파일: 헤더에 '유해인자' 열 존재 (물질분류 열 포함)
-- 소음 파일   : 헤더에 '발생형태' 열 존재 (유해인자 열 없음 -> 전부 '소음')
-파일 종류는 헤더로 자동 판별하므로 업로드 순서는 무관하다.
+- 소음제외 표: 헤더에 '유해인자' 열 존재 (물질분류 열 포함)
+- 소음 표    : 헤더에 '발생형태' 열 존재 (유해인자 열 없음 -> 전부 '소음')
+표 종류는 헤더로 자동 판별하므로 파일/시트 순서는 무관하다.
 """
+import io
 import re
 from collections import defaultdict
 from html.parser import HTMLParser
@@ -85,6 +89,35 @@ def parse_html_tables(data):
     return p.tables
 
 
+def _cell_to_str(v):
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
+
+
+def parse_xlsx_tables(data):
+    """진짜 엑셀 통합 문서(.xlsx)의 모든 시트를 표 목록으로 추출."""
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    tables = []
+    for ws in wb.worksheets:
+        rows = [[_cell_to_str(c) for c in row]
+                for row in ws.iter_rows(values_only=True)]
+        if rows:
+            tables.append(rows)
+    wb.close()
+    return tables
+
+
+def parse_any_tables(data):
+    """파일 내용으로 형식을 판별해 표 목록 추출 (xlsx zip 시그니처 = PK)."""
+    if isinstance(data, (bytes, bytearray)) and data[:2] == b"PK":
+        return parse_xlsx_tables(bytes(data))
+    return parse_html_tables(data)
+
+
 def _find_data_table(tables):
     """'공정명' 헤더가 있는 데이터 표와 헤더 인덱스 맵을 찾는다."""
     for t in tables:
@@ -148,17 +181,18 @@ def extract_jobs_from_xls(file_datas):
 
     parsed = []
     for data in file_datas:
-        tables = parse_html_tables(data)
-        rows, idx = _find_data_table(tables)
-        if rows is None:
-            continue
-        kind = _detect_kind(idx)
-        if kind:
-            parsed.append((kind, rows, idx))
+        # xlsx는 시트별로, HTML-xls는 표별로 각각 판별
+        for table in parse_any_tables(data):
+            rows, idx = _find_data_table([table])
+            if rows is None:
+                continue
+            kind = _detect_kind(idx)
+            if kind:
+                parsed.append((kind, rows, idx))
 
     if not parsed:
-        raise ValueError("표를 찾을 수 없습니다. 측정 프로그램에서 내보낸 "
-                         "엑셀(소음제외/소음) 파일인지 확인해 주세요.")
+        raise ValueError("표를 찾을 수 없습니다. MES에서 F11로 내려받은 "
+                         "엑셀(소음제외/소음)인지 확인해 주세요.")
 
     # 소음제외(chem) 먼저 처리해 단위 순서를 잡고, 소음은 뒤에 합류
     parsed.sort(key=lambda x: 0 if x[0] == "chem" else 1)
