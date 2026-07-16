@@ -164,7 +164,7 @@ def _commit_factor(entry, name):
     if not entry or not name:
         return
     cat = classify_factor(name) or "기타"
-    entry["factors"][cat].add(name)
+    entry["factors"][cat][name] = None
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +402,7 @@ def extract_job_data(pdf_path):
     # 계층적 데이터 저장: jobs[group_name][unit_name] = data
     jobs = defaultdict(lambda: defaultdict(lambda: {
         "job_content": "", # text accumulating
-        "factors": defaultdict(set),
+        "factors": defaultdict(dict),  # 이름 -> None (입력 순서 보존)
         "workers": 0,
         "work_form": set()
     }))
@@ -859,7 +859,7 @@ def extract_job_data_impl(pdf_path):
                         entry = {
                             "group": current_group,
                             "name_parts": carry_unit_parts + ([u_text] if u_text else []),
-                            "factors": defaultdict(set),
+                            "factors": defaultdict(dict),  # 이름 -> None (입력 순서 보존)
                             "workers": use_workers if use_workers else "",
                             "work_form": set(carry_forms),
                             "src": "na2" if is_noise_page else "na1",
@@ -880,7 +880,7 @@ def extract_job_data_impl(pdf_path):
                              entry = {
                                 "group": current_group,
                                 "name_parts": carry_unit_parts + ([u_text] if u_text else []),
-                                "factors": defaultdict(set),
+                                "factors": defaultdict(dict),  # 이름 -> None (입력 순서 보존)
                                 "workers": w_text if w_text else "",
                                 "work_form": set(carry_forms),
                                 "src": "na2" if is_noise_page else "na1",
@@ -998,14 +998,14 @@ def extract_job_data_impl(pdf_path):
                 new_u = {
                     "job_content": full_name,
                     "name_parts": list(u["name_parts"]),
-                    "factors": defaultdict(set),
+                    "factors": defaultdict(dict),  # 이름 -> None (입력 순서 보존)
                     "workers": u["workers"],
                     "work_form": set(u["work_form"]),
                     "src": u.get("src"),
                     "own_worker": u.get("own_worker", False),
                 }
                 for c, s in u["factors"].items():
-                    new_u["factors"][c] |= s
+                    new_u["factors"][c].update(s)
                 consolidated.append(new_u)
             else:
                 if extend_prev:
@@ -1018,7 +1018,7 @@ def extract_job_data_impl(pdf_path):
                     target["job_content"] = full_name
                     target["name_parts"] = list(u["name_parts"])
                 for c, s in u["factors"].items():
-                    target["factors"][c] |= s
+                    target["factors"][c].update(s)
                 if u["workers"] and not target["workers"]:
                     target["workers"] = u["workers"]
                 target["work_form"] |= u["work_form"]
@@ -1134,7 +1134,7 @@ def render_summary(company_info, jobs):
                     if not fset:
                         continue
                     # 혼합유기화합물(Em)은 개별 물질이 아니므로 목록에서 제외
-                    items = [x for x in sorted(fset)
+                    items = [x for x in fset
                              if not x.replace(" ", "").startswith("혼합유기화합물")]
                     if not items:
                         continue

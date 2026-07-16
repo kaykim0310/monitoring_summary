@@ -163,7 +163,7 @@ def extract_jobs_from_xls(file_datas):
                 "group": group,
                 "job_content": unit,
                 "name_parts": [unit] if unit else [],
-                "factors": defaultdict(set),
+                "factors": defaultdict(dict),  # 이름 -> None (입력 순서 보존)
                 "workers": workers or "",
                 "work_form": set(),
             }
@@ -242,9 +242,9 @@ def extract_jobs_from_xls(file_datas):
             if kind == "chem":
                 factor = cell(fi)
                 if factor:
-                    entry["factors"][classify_from_xls(factor, cell(ci))].add(factor)
+                    entry["factors"][classify_from_xls(factor, cell(ci))][factor] = None
             else:
-                entry["factors"]["물리적인자"].add("소음")
+                entry["factors"]["물리적인자"]["소음"] = None
 
     return company_info, jobs
 
