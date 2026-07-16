@@ -1075,7 +1075,7 @@ CATEGORY_DISP = {
     "금속류":     "금속류     :",
     "유기화합물": "유기화합물 :",
     "산 및 알칼리류": "산 및 알칼리류 :",
-    "가스상 물질류":  "가스상 물질류  :",
+    "가스상 물질류":  "가스상 물질    :",
     "금속가공유": "금속가공유 :",
     "허가대상 유해물질": "허가대상 유해물질 :",
     "기타":       "기타       :",
@@ -1133,10 +1133,15 @@ def render_summary(company_info, jobs):
                     fset = u["factors"].get(cat)
                     if not fset:
                         continue
+                    # 혼합유기화합물(Em)은 개별 물질이 아니므로 목록에서 제외
+                    items = [x for x in sorted(fset)
+                             if not x.replace(" ", "").startswith("혼합유기화합물")]
+                    if not items:
+                        continue
                     disp = CATEGORY_DISP.get(cat, f"{cat} :")
                     head = "    ◇ 유해인자 : " if is_first else "                  "
                     prefix = f"{head}* {disp} "
-                    lines.extend(_wrap_items(prefix, sorted(fset)))
+                    lines.extend(_wrap_items(prefix, items))
                     is_first = False
                 lines.append("")
 
